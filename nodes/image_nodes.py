@@ -3,27 +3,38 @@ import time
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-import io
 import base64
 import random
 import math
 import os
 import re
 import json
-from PIL.PngImagePlugin import PngInfo
+import importlib
+import hashlib
+import pathlib
+import logging
+from io import BytesIO
+
 try:
     import cv2
 except:
-    print("OpenCV not installed")
+    logging.warning("OpenCV not installed")
     pass
-from PIL import ImageGrab, ImageDraw, ImageFont, Image, ImageOps
+
+from PIL import ImageGrab, ImageDraw, ImageFont, Image, ImageOps, ImageSequence, ImageStat
+from PIL.PngImagePlugin import PngInfo
 
 from nodes import MAX_RESOLUTION, SaveImage
-from comfy_extras.nodes_mask import ImageCompositeMasked
+from comfy_extras.nodes_mask import composite
 from comfy.cli_args import args
 from comfy.utils import ProgressBar, common_upscale
-import folder_paths
 from comfy import model_management
+from comfy_api.latest import io
+import node_helpers
+import folder_paths
+
+from ..utility.utility import string_to_color
+
 try:
     from server import PromptServer
 except:
@@ -96,6 +107,10 @@ https://github.com/hahnec/color-matcher/
 """
     
     def colormatch(self, image_ref, image_target, method, strength=1.0, multithread=True):
+        # Skip unnecessary processing
+        if strength == 0:
+            return (image_target,)
+
         try:
             from color_matcher import ColorMatcher
         except:
@@ -116,11 +131,14 @@ https://github.com/hahnec/color-matcher/
             image_target_np_i = images_target_np if batch_size == 1 else images_target[i].numpy()
             image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
             try:
-                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method)
-                image_result = image_target_np_i + strength * (image_result - image_target_np_i)
+                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method) # Avoid potential blur when only the fully color-matched image is used
+                if strength != 1:
+                    image_result = image_target_np_i + strength * (image_result - image_target_np_i)
+                    
                 return torch.from_numpy(image_result)
+                
             except Exception as e:
-                print(f"Thread {i} error: {e}")
+                logging.warning(f"Thread {i} error: {e}")
                 return torch.from_numpy(image_target_np_i)  # fallback
 
         if multithread and batch_size > 1:
@@ -133,7 +151,112 @@ https://github.com/hahnec/color-matcher/
         out = torch.stack(out, dim=0).to(torch.float32)
         out.clamp_(0, 1)
         return (out,)
-    
+
+class ColorMatchV2(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ColorMatchV2",
+            category="KJNodes/image",
+            description="""
+color-matcher enables color transfer across images which comes in handy for automatic  
+color-grading of photographs, paintings and film sequences as well as light-field  
+and stopmotion corrections.  
+
+The methods behind the mappings are based on the approach from Reinhard et al.,  
+the Monge-Kantorovich Linearization (MKL) as proposed by Pitie et al. and our analytical solution  
+to a Multi-Variate Gaussian Distribution (MVGD) transfer in conjunction with classical histogram   
+matching. As shown below our HM-MVGD-HM compound outperforms existing methods.   
+https://github.com/hahnec/color-matcher/   
+
+'reinhard_lab_gpu' method uses Kornia for GPU-accelerated color transfer in Lab color space.
+""",
+            inputs=[
+                io.Image.Input("image_target"),
+                io.Image.Input("image_ref"),
+                io.Combo.Input("method", 
+                    options=['mkl', 'hm', 'reinhard', 'mvgd', 'hm-mvgd-hm', 'hm-mkl-hm', 'reinhard_lab_gpu'],
+                    default='mkl'),
+                io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
+                io.Boolean.Input("multithread", default=True),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, image_target, image_ref, method, strength=1.0, multithread=True) -> io.NodeOutput:
+        # Skip unnecessary processing
+        if strength == 0:
+            return io.NodeOutput(image_target)
+
+        if method == "reinhard_lab_gpu":
+            import kornia
+            device = model_management.get_torch_device()
+
+            B, H, W, C = image_target.shape
+
+            src_bchw = image_target.to(device).permute(0, 3, 1, 2).contiguous() # (B, H, W, C) -> (B, C, H, W)
+            ref_bchw = image_ref.to(device).permute(0, 3, 1, 2).contiguous()
+            # RGB->Lab
+            src_lab = kornia.color.rgb_to_lab(src_bchw)
+            ref_lab = kornia.color.rgb_to_lab(ref_bchw)
+
+            src_lab_flat = src_lab.view(B, C, -1)  # (B, C, HW)
+            ref_lab_flat = ref_lab.view(ref_lab.shape[0], C, -1)  # (B or 1, C, HW)
+
+            src_std, src_mean = torch.std_mean(src_lab_flat, dim=-1, keepdim=True, unbiased=False)
+            ref_std, ref_mean = torch.std_mean(ref_lab_flat, dim=-1, keepdim=True, unbiased=False)
+            src_std = src_std.clamp_min_(1e-6)
+
+            if ref_lab.shape[0] == 1 and B > 1:
+                ref_mean = ref_mean.expand(B, -1, -1)
+                ref_std = ref_std.expand(B, -1, -1)
+
+            corrected_lab_flat = (src_lab_flat - src_mean) * (ref_std / src_std) + ref_mean
+            corrected_lab = corrected_lab_flat.view(B, C, H, W)
+
+            # Lab->RGB
+            corrected_rgb_01 = kornia.color.lab_to_rgb(corrected_lab)
+            out = (1.0 - strength) * src_bchw + strength * corrected_rgb_01
+            out = out.permute(0, 2, 3, 1).contiguous() # (B, C, H, W) -> (B, H, W, C)
+
+            return io.NodeOutput(out.cpu().float().clamp_(0, 1))
+
+        try:
+            from color_matcher import ColorMatcher
+        except:
+            raise Exception("Can't import color-matcher, did you install requirements.txt? Manual install: pip install color-matcher")
+
+        batch_size = image_target.size(0)
+        ref_batch_size = image_ref.size(0)
+
+        def process(i):
+            cm = ColorMatcher()
+            image_target_np = image_target[i].cpu().numpy()
+            image_ref_np = image_ref[min(i, ref_batch_size - 1)].cpu().numpy()
+            try:
+                image_result = cm.transfer(src=image_target_np, ref=image_ref_np, method=method)
+                if strength != 1:
+                    image_result = image_target_np + strength * (image_result - image_target_np)
+
+                return torch.from_numpy(image_result)
+
+            except Exception as e:
+                logging.error(f"Thread {i} error: {e}")
+                return torch.from_numpy(image_target_np)  # fallback
+        if multithread and batch_size > 1:
+            max_threads = min(os.cpu_count() or 1, batch_size)
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                out = list(executor.map(process, range(batch_size)))
+        else:
+            out = [process(i) for i in range(batch_size)]
+
+        out = torch.stack(out, dim=0).to(torch.float32).clamp_(0, 1)
+
+        return io.NodeOutput(out)
+
 class SaveImageWithAlpha:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
@@ -158,16 +281,13 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
 """
 
     def save_images_alpha(self, images, mask, filename_prefix="ComfyUI_image_with_alpha", prompt=None, extra_pnginfo=None):
-        from PIL.PngImagePlugin import PngInfo
         filename_prefix += self.prefix_append
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         results = list()
-        if mask.dtype == torch.float16:
-            mask = mask.to(torch.float32)
         def file_counter():
             max_counter = 0
             # Loop through the existing files
-            for existing_file in os.listdir(full_output_folder):
+            for existing_file in sorted(os.listdir(full_output_folder)):
                 # Check if the file matches the expected format
                 match = re.fullmatch(fr"{filename}_(\d+)_?\.[a-zA-Z0-9]+", existing_file)
                 if match:
@@ -180,9 +300,9 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
 
         for image, alpha in zip(images, mask):
             i = 255. * image.cpu().numpy()
-            a = 255. * alpha.cpu().numpy()
+            a = 255. * (1.0 - alpha.cpu().float()).numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            
+
              # Resize the mask to match the image size
             a_resized = Image.fromarray(a).resize(img.size, Image.LANCZOS)
             a_resized = np.clip(a_resized, 0, 255).astype(np.uint8)
@@ -195,7 +315,7 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
                 if extra_pnginfo is not None:
                     for x in extra_pnginfo:
                         metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-           
+
             # Increment the counter by 1 to get the next available value
             counter = file_counter() + 1
             file = f"{filename}_{counter:05}.png"
@@ -306,8 +426,6 @@ Concatenates the image2 to image1 in the specified direction.
             concatenated_image = torch.cat((image2_resized, image1), dim=1)  # Concatenate along height
         return concatenated_image,
 
-import torch  # Make sure you have PyTorch installed
-
 class ImageConcatFromBatch:
     @classmethod
     def INPUT_TYPES(s):
@@ -331,8 +449,8 @@ class ImageConcatFromBatch:
         batch_size, height, width, channels = images.shape
         num_rows = (batch_size + num_columns - 1) // num_columns  # Calculate number of rows
 
-        print(f"Initial dimensions: batch_size={batch_size}, height={height}, width={width}, channels={channels}")
-        print(f"num_rows={num_rows}, num_columns={num_columns}")
+        logging.info(f"Initial dimensions: batch_size={batch_size}, height={height}, width={width}, channels={channels}")
+        logging.info(f"num_rows={num_rows}, num_columns={num_columns}")
 
         if match_image_size:
             target_shape = images[0].shape
@@ -350,7 +468,7 @@ class ImageConcatFromBatch:
                     target_width = target_shape[1]
                     target_height = int(target_width / original_aspect_ratio)
 
-                print(f"Resizing image from ({original_height}, {original_width}) to ({target_height}, {target_width})")
+                logging.info(f"Resizing image from ({original_height}, {original_width}) to ({target_height}, {target_width})")
 
                 # Resize the image to match the target size while preserving aspect ratio
                 resized_image = common_upscale(image.movedim(-1, 0), target_width, target_height, "lanczos", "disabled")
@@ -366,7 +484,7 @@ class ImageConcatFromBatch:
         grid_height = num_rows * height
         grid_width = num_columns * width
 
-        print(f"Grid dimensions before scaling: grid_height={grid_height}, grid_width={grid_width}")
+        logging.info(f"Grid dimensions before scaling: grid_height={grid_height}, grid_width={grid_width}")
 
         # Original scale factor calculation remains unchanged
         scale_factor = min(max_resolution / grid_height, max_resolution / grid_width, 1.0)
@@ -387,8 +505,8 @@ class ImageConcatFromBatch:
         # Recalculate grid dimensions with adjusted height and width
         grid_height = num_rows * height
         grid_width = num_columns * width
-        print(f"Grid dimensions after scaling: grid_height={grid_height}, grid_width={grid_width}")
-        print(f"Final image dimensions: height={height}, width={width}")
+        logging.info(f"Grid dimensions after scaling: grid_height={grid_height}, grid_width={grid_width}")
+        logging.info(f"Final image dimensions: height={height}, width={width}")
 
         grid = torch.zeros((grid_height, grid_width, channels), dtype=images.dtype)
 
@@ -548,7 +666,7 @@ Can be used for realtime diffusion with autoqueue.
                 time.sleep(delay)
 
         elapsed_time = time.time() - start_time
-        print(f"screengrab took {elapsed_time} seconds.")
+        logging.info(f"screengrab took {elapsed_time} seconds.")
         
         return (torch.cat(captures, dim=0),)
     
@@ -692,32 +810,47 @@ Note that this changes the input image's height!
 Fonts are loaded from this folder:  
 ComfyUI/custom_nodes/ComfyUI-KJNodes/fonts
 """
-        
+
     def addlabel(self, image, text_x, text_y, text, height, font_size, font_color, label_color, font, direction, caption=""):
         batch_size = image.shape[0]
         width = image.shape[2]
-        
+
         font_path = os.path.join(script_directory, "fonts", "TTNorms-Black.otf") if font == "TTNorms-Black.otf" else folder_paths.get_full_path("kjnodes_fonts", font)
-        
+
+        # Parse colors using helper function
+        font_color_rgb = string_to_color(font_color)
+        label_color_rgb = string_to_color(label_color)
+
+        # Convert to tuples for PIL
+        font_color_tuple = tuple(font_color_rgb[:3])  # RGB only
+        label_color_tuple = tuple(label_color_rgb[:3])  # RGB only
+
         def process_image(input_image, caption_text):
             font = ImageFont.truetype(font_path, font_size)
-            words = caption_text.split()
             lines = []
-            current_line = []
-            current_line_width = 0
-
-            for word in words:
-                word_width = font.getbbox(word)[2]
-                if current_line_width + word_width <= width - 2 * text_x:
-                    current_line.append(word)
-                    current_line_width += word_width + font.getbbox(" ")[2]  # Add space width
-                else:
+            for text_line in caption_text.split('\n'):
+                if text_line.strip() == "":
+                    # Preserve empty lines for multiple newlines
+                    lines.append("")
+                    continue
+                words = text_line.split()
+                current_line = []
+                for word in words:
+                    if current_line:
+                        test_line = " ".join(current_line + [word])
+                    else:
+                        test_line = word
+                    try:
+                        test_line_width = font.getbbox(test_line)[2]
+                    except Exception:
+                        test_line_width = font.getsize(test_line)[0]
+                    if test_line_width <= width - 2 * text_x:
+                        current_line.append(word)
+                    else:
+                        lines.append(" ".join(current_line))
+                        current_line = [word]
+                if current_line:
                     lines.append(" ".join(current_line))
-                    current_line = [word]
-                    current_line_width = word_width
-
-            if current_line:
-                lines.append(" ".join(current_line))
 
             if direction == 'overlay':
                 pil_image = Image.fromarray((input_image.cpu().numpy() * 255).astype(np.uint8))
@@ -726,26 +859,26 @@ ComfyUI/custom_nodes/ComfyUI-KJNodes/fonts
                     # Adjust the image height automatically
                     margin = 8
                     required_height = (text_y + len(lines) * font_size) + margin # Calculate required height
-                    pil_image = Image.new("RGB", (width, required_height), label_color)
+                    pil_image = Image.new("RGB", (width, required_height), label_color_tuple)
                 else:
                     # Initialize with a minimal height
-                    label_image = Image.new("RGB", (width, height), label_color)
+                    label_image = Image.new("RGB", (width, height), label_color_tuple)
                     pil_image = label_image
 
             draw = ImageDraw.Draw(pil_image)
-            
+
 
             y_offset = text_y
             for line in lines:
                 try:
-                    draw.text((text_x, y_offset), line, font=font, fill=font_color, features=['-liga'])
+                    draw.text((text_x, y_offset), line, font=font, fill=font_color_tuple, features=['-liga'])
                 except:
-                    draw.text((text_x, y_offset), line, font=font, fill=font_color)
+                    draw.text((text_x, y_offset), line, font=font, fill=font_color_tuple)
                 y_offset += font_size
 
             processed_image = torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
             return processed_image
-        
+
         if caption == "":
             processed_images = [process_image(img, text) for img in image]
         else:
@@ -794,9 +927,38 @@ and passes it through unchanged.
             "text": [f"{count}x{width}x{height}"]}, 
             "result": (image, width, height, count) 
         }
-    
+
+class GetLatentSizeAndCount:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "latent": ("LATENT",),
+        }}
+
+    RETURN_TYPES = ("LATENT","INT", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("latent", "batch_size", "channels", "frames", "height", "width")
+    FUNCTION = "getsize"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Returns latent tensor dimensions,  
+and passes the latent through unchanged.  
+
+"""
+    def getsize(self, latent):
+        if len(latent["samples"].shape) == 5:
+            B, C, T, H, W = latent["samples"].shape
+        elif len(latent["samples"].shape) == 4:
+            B, C, H, W = latent["samples"].shape
+            T = 0
+        else:
+            raise ValueError("Invalid latent shape")
+
+        return {"ui": {
+            "text": [f"{B}x{C}x{T}x{H}x{W}"]}, 
+            "result": (latent, B, C, T, H, W) 
+        }
+
 class ImageBatchRepeatInterleaving:
-    
     RETURN_TYPES = ("IMAGE", "MASK",)
     FUNCTION = "repeat"
     CATEGORY = "KJNodes/image"
@@ -817,47 +979,52 @@ with repeats 2 becomes batch of 10 images: 0, 0, 1, 1, 2, 2, 3, 3, 4, 4
                 "mask": ("MASK",),
             }
         }
-    
+
     def repeat(self, images, repeats, mask=None):
         original_count = images.shape[0]
         total_count = original_count * repeats
-       
+
         repeated_images = torch.repeat_interleave(images, repeats=repeats, dim=0)
         if mask is not None:
             mask = torch.repeat_interleave(mask, repeats=repeats, dim=0)
         else:
-            mask = torch.zeros((total_count, images.shape[1], images.shape[2]), 
+            mask = torch.zeros((total_count, images.shape[1], images.shape[2]),
                               device=images.device, dtype=images.dtype)
             for i in range(original_count):
                 mask[i * repeats] = 1.0
 
-        print("mask shape", mask.shape)
         return (repeated_images, mask)
-    
+
 class ImageUpscaleWithModelBatched:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "upscale_model": ("UPSCALE_MODEL",),
                               "images": ("IMAGE",),
                               "per_batch": ("INT", {"default": 16, "min": 1, "max": 4096, "step": 1}),
-                              }}
+                              },
+                "optional": {
+                    "downscale_ratio": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01}),
+                    "downscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "lanczos"}),
+                    "precision": (["float32", "float16", "bfloat16"], {"default": "float32"}),
+                }}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """
 Same as ComfyUI native model upscaling node,  
 but allows setting sub-batches for reduced VRAM usage.
+Optionally downscale the result with a ratio.
 """
-    def upscale(self, upscale_model, images, per_batch):
-        
+    def upscale(self, upscale_model, images, per_batch, downscale_ratio=1.0, downscale_method="lanczos", precision="float32"):
+        dtype = torch.float16 if precision == "float16" else torch.bfloat16 if precision == "bfloat16" else torch.float32
         device = model_management.get_torch_device()
-        upscale_model.to(device)
-        in_img = images.movedim(-1,-3)
-        
+        upscale_model.to(device, dtype=dtype)
+        in_img = images.movedim(-1,-3).to(dtype)
+
         steps = in_img.shape[0]
         pbar = ProgressBar(steps)
         t = []
-        
+
         for start_idx in range(0, in_img.shape[0], per_batch):
             sub_images = upscale_model(in_img[start_idx:start_idx+per_batch].to(device))
             t.append(sub_images.cpu())
@@ -866,8 +1033,18 @@ but allows setting sub-batches for reduced VRAM usage.
             # Update the progress bar by the number of images processed in this batch
             pbar.update(batch_count)
         upscale_model.cpu()
-        
-        t = torch.cat(t, dim=0).permute(0, 2, 3, 1).cpu()
+
+        t = torch.cat(t, dim=0).permute(0, 2, 3, 1).cpu().float()
+
+        # Apply downscaling if ratio is less than 1.0
+        if downscale_ratio < 1.0:
+            original_height = t.shape[1]
+            original_width = t.shape[2]
+            new_height = int(original_height * downscale_ratio)
+            new_width = int(original_width * downscale_ratio)
+            t = t.movedim(-1, 1)
+            t = common_upscale(t, new_width, new_height, downscale_method, "disabled")
+            t = t.movedim(1, -1)
 
         return (t,)
 
@@ -1004,7 +1181,7 @@ class ImagePadForOutpaintMasked:
     def expand_image(self, image, left, top, right, bottom, feathering, mask=None):
         if mask is not None:
             if torch.allclose(mask, torch.zeros_like(mask)):
-                    print("Warning: The incoming mask is fully black. Handling it as None.")
+                    logging.warning("The incoming mask is fully black. Handling it as None.")
                     mask = None
         B, H, W, C = image.size()
 
@@ -1097,16 +1274,17 @@ class ImagePadForOutpaintTargetSize:
             
             # Downscale the image
             image_scaled = common_upscale(image, new_width, new_height, upscale_method, "disabled").movedim(1,-1)
-            if mask is not None:
-                mask_scaled = mask.unsqueeze(0)  # Add an extra dimension for batch size
-                mask_scaled = F.interpolate(mask_scaled, size=(new_height, new_width), mode="nearest")
-                mask_scaled = mask_scaled.squeeze(0)  # Remove the extra dimension after interpolation
-            else:
-                mask_scaled = mask
         else:
             # If downscaling is not needed, use the original image dimensions
             image_scaled = image
-            mask_scaled = mask
+
+        # Ensure mask dimensions match image dimensions
+        if mask is not None:
+            mask_scaled = mask.unsqueeze(0)  # Add an extra dimension for batch size
+            mask_scaled = F.interpolate(mask_scaled, size=(new_height, new_width), mode="nearest")
+            mask_scaled = mask_scaled.squeeze(0)  # Remove the extra dimension after interpolation
+        else:
+            mask_scaled = None
 
         # Calculate how much padding is needed to reach the target dimensions
         pad_top = max(0, (target_height - new_height) // 2)
@@ -1143,7 +1321,7 @@ class ImagePrepForICLora:
 
         if reference_mask is not None:
             if torch.allclose(reference_mask, torch.zeros_like(reference_mask)):
-                    print("Warning: The incoming mask is fully black. Handling it as None.")
+                    logging.warning("The incoming mask is fully black. Handling it as None.")
                     reference_mask = None
         image = reference_image
         if latent_image is not None:
@@ -1158,7 +1336,6 @@ class ImagePrepForICLora:
                 size=(H, W),
                 mode='nearest'
             ).squeeze(1)
-            print(resized_mask.shape)
             image = image * resized_mask.unsqueeze(-1)
 
         # Calculate new width maintaining aspect ratio
@@ -1199,7 +1376,7 @@ class ImagePrepForICLora:
                 padded_mask[:, :, :new_width] = 0
 
         return (padded_image, padded_mask)
-        
+
 
 class ImageAndMaskPreview(SaveImage):
     def __init__(self):
@@ -1213,12 +1390,12 @@ class ImageAndMaskPreview(SaveImage):
         return {
             "required": {
                 "mask_opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mask_color": ("STRING", {"default": "255, 255, 255"}),
+                "mask_color": ("STRING", {"default": "255, 255, 255", "tooltip": "RGB (255,255,255) or RGBA (255,255,255,128) or Hex (#RRGGBB / #RRGGBBAA)"}),
                 "pass_through": ("BOOLEAN", {"default": False}),
              },
             "optional": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),                
+                "mask": ("MASK",),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1232,7 +1409,7 @@ composites the mask on top of the image.
 with pass_through on the preview is disabled and the  
 composite is returned from the composite slot instead,  
 this allows for the preview to be passed for video combine  
-nodes for example.
+nodes for example. Supports RGBA for mask_color to adjust transparency per color.  
 """
 
     def execute(self, mask_opacity, mask_color, pass_through, filename_prefix="ComfyUI", image=None, mask=None, prompt=None, extra_pnginfo=None):
@@ -1244,16 +1421,21 @@ nodes for example.
             mask_adjusted = mask * mask_opacity
             mask_image = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3).clone()
 
-            if ',' in mask_color:
-                color_list = np.clip([int(channel) for channel in mask_color.split(',')], 0, 255) # RGB format
-            else:
-                mask_color = mask_color.lstrip('#')
-                color_list = [int(mask_color[i:i+2], 16) for i in (0, 2, 4)] # Hex format
+            # Use helper function to parse color string
+            color_list = string_to_color(mask_color)
+
+            # Apply RGB channels
             mask_image[:, :, :, 0] = color_list[0] / 255 # Red channel
             mask_image[:, :, :, 1] = color_list[1] / 255 # Green channel
             mask_image[:, :, :, 2] = color_list[2] / 255 # Blue channel
-            
-            preview, = ImageCompositeMasked.composite(self, image, mask_image, 0, 0, True, mask_adjusted)
+
+            if len(color_list) == 4: # Apply Alpha channel if present
+                alpha_factor = color_list[3] / 255.0
+                mask_adjusted = mask_adjusted * alpha_factor
+
+            destination, source = node_helpers.image_alpha_fix(image, mask_image)
+            destination = destination.clone().movedim(-1, 1)
+            preview = composite(destination, source.movedim(-1, 1), 0, 0, mask_adjusted, 1, True).movedim(1, -1)
         if pass_through:
             return (preview, )
         return(self.save_images(preview, filename_prefix, prompt, extra_pnginfo))
@@ -1467,17 +1649,6 @@ def gaussian_blur(mask, blur_radius):
         mask = F.conv2d(mask, kernel2d, padding=kernel_size // 2, groups=mask.shape[1])
         mask = mask.squeeze(0).permute(1, 2, 0)  # Change back to [H, W, C]
     return mask
-
-easing_functions = {
-    "linear": lambda t: t,
-    "ease_in": ease_in,
-    "ease_out": ease_out,
-    "ease_in_out": ease_in_out,
-    "bounce": bounce,
-    "elastic": elastic,
-    "glitchy": glitchy,
-    "exponential_ease_out": exponential_ease_out,
-}
 
 class TransitionImagesMulti:
     RETURN_TYPES = ("IMAGE",)
@@ -1742,6 +1913,110 @@ Returns a range of images from a batch.
             chosen_masks = masks[start_index:end_index]
 
         return (chosen_images, chosen_masks,)
+
+class ImageBatchExtendWithOverlap:
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", )
+    RETURN_NAMES = ("source_images", "start_images", "extended_images")
+    OUTPUT_TOOLTIPS = (
+        "The original source images (passthrough)",
+        "The input images used as the starting point for extension",
+        "The extended images with overlap, if no new images are provided this will be empty",
+    )
+    FUNCTION = "imagesfrombatch"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Helper node for video generation extension   
+First input source and overlap amount to get the starting frames for the extension.  
+Then on another copy of the node provide the newly generated frames and choose how to overlap them.
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "source_images": ("IMAGE", {"tooltip": "The source images to extend"}),
+                "overlap": ("INT", {"default": 13,"min": 1, "max": 4096, "step": 1, "tooltip": "Number of overlapping frames between source and new images"}),
+                "overlap_side": (["source", "new_images"], {"default": "source", "tooltip": "Which side to overlap on"}),
+                "overlap_mode": (["cut", "linear_blend", "ease_in_out", "filmic_crossfade", "perceptual_crossfade"], {"default": "linear_blend", "tooltip": "Method to use for overlapping frames"}),
+        },
+        "optional": {
+            "new_images": ("IMAGE", {"tooltip": "The new images to extend with"}),
+        }
+    }
+
+    def imagesfrombatch(self, source_images, overlap, overlap_side, overlap_mode, new_images=None):
+        if overlap > len(source_images):
+            return source_images, source_images, source_images
+
+        if new_images is not None:
+            if source_images.shape[1:3] != new_images.shape[1:3]:
+                raise ValueError(f"Source and new images must have the same shape: {source_images.shape[1:3]} vs {new_images.shape[1:3]}")
+            # Determine where to place the overlap
+            prefix = source_images[:-overlap]
+            if overlap_side == "source":
+                blend_src = source_images[-overlap:]
+                blend_dst = new_images[:overlap]
+            elif overlap_side == "new_images":
+                blend_src = new_images[:overlap]
+                blend_dst = source_images[-overlap:]
+            suffix = new_images[overlap:]
+
+            if overlap_mode == "linear_blend":
+                # Vectorized version - process all frames at once
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                alpha = alpha.view(-1, 1, 1, 1)  # Shape: [overlap, 1, 1, 1]
+                blended_images = (1 - alpha) * blend_src + alpha * blend_dst
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "filmic_crossfade":
+                gamma = 2.2
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                alpha = alpha.view(-1, 1, 1, 1)
+                linear_src = torch.pow(blend_src, gamma)
+                linear_dst = torch.pow(blend_dst, gamma)
+                blended = (1 - alpha) * linear_src + alpha * linear_dst
+                blended_images = torch.pow(blended, 1.0 / gamma)
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "perceptual_crossfade":
+                import kornia
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+
+                src_nchw = blend_src.movedim(-1, 1)
+                dst_nchw = blend_dst.movedim(-1, 1)
+                lab_src = kornia.color.rgb_to_lab(src_nchw)
+                lab_dst = kornia.color.rgb_to_lab(dst_nchw)
+
+                # Blend in LAB space
+                alpha = alpha.view(-1, 1, 1, 1)  # [N,1,1,1] for broadcasting
+                blended_lab = (1 - alpha) * lab_src + alpha * lab_dst
+
+                # Convert back to RGB and reshape
+                blended_rgb = kornia.color.lab_to_rgb(blended_lab)
+                blended_images = blended_rgb.movedim(1, -1)  # [N,C,H,W] -> [N,H,W,C]
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "ease_in_out":
+                # Vectorized ease_in_out
+                t = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                eased_t = 3 * t * t - 2 * t * t * t  # ease_in_out formula
+                eased_t = eased_t.view(-1, 1, 1, 1)
+                blended_images = (1 - eased_t) * blend_src + eased_t * blend_dst
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "cut":
+                extended_images = torch.cat((prefix, suffix), dim=0)
+                if overlap_side == "new_images":
+                    extended_images = torch.cat((source_images, new_images[overlap:]), dim=0)
+                elif overlap_side == "source":
+                    extended_images = torch.cat((source_images[:-overlap], new_images), dim=0)
+        else:
+            extended_images = torch.zeros((1, 64, 64, 3), device="cpu")
+
+        start_images = source_images[-overlap:]
+
+        return (source_images, start_images, extended_images)
 
 class GetLatentRangeFromBatch:
     
@@ -2120,7 +2395,6 @@ class ImageBatchMulti:
             "required": {
                 "inputcount": ("INT", {"default": 2, "min": 2, "max": 1000, "step": 1}),
                 "image_1": ("IMAGE", ),
-                
             },
             "optional": {
                 "image_2": ("IMAGE", ),
@@ -2138,14 +2412,39 @@ with the **inputcount** and clicking update.
 """
 
     def combine(self, inputcount, **kwargs):
-        from nodes import ImageBatch
-        image_batch_node = ImageBatch()
-        image = kwargs["image_1"].cpu()
-        first_image_shape = image.shape
+        first = kwargs["image_1"]
+        h, w = first.shape[1], first.shape[2]
+
+        # determine output shape
+        max_ch = first.shape[-1]
+        total_frames = first.shape[0]
         for c in range(1, inputcount):
-            new_image = kwargs.get(f"image_{c + 1}", torch.zeros(first_image_shape)).cpu()
-            image, = image_batch_node.batch(image, new_image)
-        return (image,)
+            img = kwargs.get(f"image_{c + 1}")
+            if img is not None:
+                max_ch = max(max_ch, img.shape[-1])
+                total_frames += img.shape[0]
+            else:
+                total_frames += first.shape[0]
+
+        # pre-allocate output
+        out = torch.empty((total_frames, h, w, max_ch), dtype=first.dtype)
+        offset = 0
+
+        for c in range(inputcount):
+            img = kwargs.get(f"image_{c + 1}", torch.zeros((first.shape[0], h, w, max_ch), dtype=first.dtype))
+
+            if img.shape[1:3] != (h, w):
+                img = common_upscale(img.movedim(-1, 1), w, h, "bilinear", "center").movedim(1, -1)
+
+            if img.shape[-1] < max_ch:
+                img = torch.nn.functional.pad(img, (0, max_ch - img.shape[-1]), mode='constant', value=1.0)
+
+            n = img.shape[0]
+            out[offset:offset + n].copy_(img, non_blocking=True)
+            offset += n
+            del img
+
+        return (out.cpu(),)
 
 
 class ImageTensorList:
@@ -2330,7 +2629,7 @@ class PreviewAnimation:
                 mask_img = Image.fromarray(np.clip(mask_np, 0, 255).astype(np.uint8))
                 pil_images.append(mask_img)
         else:
-            print("PreviewAnimation: No images or masks provided")
+            logging.warning("PreviewAnimation: No images or masks provided")
             return { "ui": { "images": results, "animated": (None,), "text": "empty" }}
 
         num_frames = len(pil_images)
@@ -2436,7 +2735,7 @@ class ImageResizeKJv2:
                 "width": ("INT", { "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                 "height": ("INT", { "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                 "upscale_method": (s.upscale_methods,),
-                "keep_proportion": (["stretch", "resize", "pad", "pad_edge", "crop"], { "default": False }),
+                "keep_proportion": (["stretch", "resize", "pad", "pad_edge", "pad_edge_pixel", "crop", "pillarbox_blur", "total_pixels"], { "default": False }),
                 "pad_color": ("STRING", { "default": "0, 0, 0", "tooltip": "Color to use for padding."}),
                 "crop_position": (["center", "top", "bottom", "left", "right"], { "default": "center" }),
                 "divisible_by": ("INT", { "default": 2, "min": 0, "max": 512, "step": 1, }),
@@ -2444,6 +2743,7 @@ class ImageResizeKJv2:
             "optional" : {
                 "mask": ("MASK",),
                 "device": (["cpu", "gpu"],),
+                #"per_batch": ("INT", { "default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, "tooltip": "Process images in sub-batches to reduce memory usage. 0 disables sub-batching."}),
             },
              "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -2462,7 +2762,7 @@ Keep proportions keeps the aspect ratio of the image, by
 highest dimension.  
 """
 
-    def resize(self, image, width, height, keep_proportion, upscale_method, divisible_by, pad_color, crop_position, unique_id, device="cpu", mask=None):
+    def resize(self, image, width, height, keep_proportion, upscale_method, divisible_by, pad_color, crop_position, unique_id, device="cpu", mask=None, per_batch=64):
         B, H, W, C = image.shape
 
         if device == "gpu":
@@ -2472,26 +2772,39 @@ highest dimension.
         else:
             device = torch.device("cpu")
 
-        if width == 0:
-            width = W
-        if height == 0:
-            height = H
-        
-        if keep_proportion == "resize" or keep_proportion.startswith("pad"):
+        pillarbox_blur = keep_proportion == "pillarbox_blur"
+
+        # Initialize padding variables
+        pad_left = pad_right = pad_top = pad_bottom = 0
+
+        if keep_proportion in ["resize", "total_pixels"] or keep_proportion.startswith("pad") or pillarbox_blur:
+            if keep_proportion == "total_pixels":
+                total_pixels = width * height
+                aspect_ratio = W / H
+                new_height = int(math.sqrt(total_pixels / aspect_ratio))
+                new_width = int(math.sqrt(total_pixels * aspect_ratio))
+
             # If one of the dimensions is zero, calculate it to maintain the aspect ratio
-            if width == 0 and height != 0:
+            elif width == 0 and height == 0:
+                new_width = W
+                new_height = H
+            elif width == 0 and height != 0:
                 ratio = height / H
                 new_width = round(W * ratio)
+                new_height = height
             elif height == 0 and width != 0:
                 ratio = width / W
+                new_width = width
                 new_height = round(H * ratio)
             elif width != 0 and height != 0:
-                # Scale based on which dimension is smaller in proportion to the desired dimensions
                 ratio = min(width / W, height / H)
                 new_width = round(W * ratio)
                 new_height = round(H * ratio)
+            else:
+                new_width = width
+                new_height = height
 
-            if keep_proportion.startswith("pad"):
+            if keep_proportion.startswith("pad") or pillarbox_blur:
                 # Calculate padding based on position
                 if crop_position == "center":
                     pad_left = (width - new_width) // 2
@@ -2521,64 +2834,78 @@ highest dimension.
 
             width = new_width
             height = new_height
+        else:
+            if width == 0:
+                width = W
+            if height == 0:
+                height = H
 
         if divisible_by > 1:
             width = width - (width % divisible_by)
             height = height - (height % divisible_by)
 
-        out_image = image.clone().to(device)
+        # Preflight estimate (log-only when batching is active)
+        if per_batch != 0 and B > per_batch:
+            try:
+                bytes_per_elem = image.element_size()  # typically 4 for float32
+                est_total_bytes = B * height * width * C * bytes_per_elem
+                est_mb = est_total_bytes / (1024 * 1024)
+                msg = f"<tr><td>Resize v2</td><td>estimated output ~{est_mb:.2f} MB; batching {per_batch}/{B}</td></tr>"
+                if unique_id and PromptServer is not None:
+                    try:
+                        PromptServer.instance.send_progress_text(msg, unique_id)
+                    except:
+                        pass
+                else:
+                    logging.info(f"[ImageResizeKJv2] estimated output ~{est_mb:.2f} MB; batching {per_batch}/{B}")
+            except:
+                pass
 
-        if mask is not None:
-            out_mask = mask.clone().to(device)
-        else:
-            out_mask = None
-        
-        if keep_proportion == "crop":
-            old_width = W
-            old_height = H
-            old_aspect = old_width / old_height
-            new_aspect = width / height
-            
-            # Calculate dimensions to keep
-            if old_aspect > new_aspect:  # Image is wider than target
-                crop_w = round(old_height * new_aspect)
-                crop_h = old_height
-            else:  # Image is taller than target
-                crop_w = old_width
-                crop_h = round(old_width / new_aspect)
-            
-            # Calculate crop position
-            if crop_position == "center":
-                x = (old_width - crop_w) // 2
-                y = (old_height - crop_h) // 2
-            elif crop_position == "top":
-                x = (old_width - crop_w) // 2
-                y = 0
-            elif crop_position == "bottom":
-                x = (old_width - crop_w) // 2
-                y = old_height - crop_h
-            elif crop_position == "left":
-                x = 0
-                y = (old_height - crop_h) // 2
-            elif crop_position == "right":
-                x = old_width - crop_w
-                y = (old_height - crop_h) // 2
-            
-            # Apply crop
-            out_image = out_image.narrow(-2, x, crop_w).narrow(-3, y, crop_h)
-            if mask is not None:
-                out_mask = out_mask.narrow(-1, x, crop_w).narrow(-2, y, crop_h)
-        
-        out_image = common_upscale(out_image.movedim(-1,1), width, height, upscale_method, crop="disabled").movedim(1,-1)
+        def _process_subbatch(in_image, in_mask, pad_left, pad_right, pad_top, pad_bottom):
+            # Avoid unnecessary clones; only move if needed
+            out_image = in_image if in_image.device == device else in_image.to(device)
+            out_mask = None if in_mask is None else (in_mask if in_mask.device == device else in_mask.to(device))
 
-        if mask is not None:
-            if upscale_method == "lanczos":
-                out_mask = common_upscale(out_mask.unsqueeze(1).repeat(1, 3, 1, 1), width, height, upscale_method, crop="disabled").movedim(1,-1)[:, :, :, 0]
-            else:
-                out_mask = common_upscale(out_mask.unsqueeze(1), width, height, upscale_method, crop="disabled").squeeze(1)
-            
-        if keep_proportion.startswith("pad"):
-            if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+            # Crop logic
+            if keep_proportion == "crop":
+                old_height = out_image.shape[-3]
+                old_width = out_image.shape[-2]
+                old_aspect = old_width / old_height
+                new_aspect = width / height
+                if old_aspect > new_aspect:
+                    crop_w = round(old_height * new_aspect)
+                    crop_h = old_height
+                else:
+                    crop_w = old_width
+                    crop_h = round(old_width / new_aspect)
+                if crop_position == "center":
+                    x = (old_width - crop_w) // 2
+                    y = (old_height - crop_h) // 2
+                elif crop_position == "top":
+                    x = (old_width - crop_w) // 2
+                    y = 0
+                elif crop_position == "bottom":
+                    x = (old_width - crop_w) // 2
+                    y = old_height - crop_h
+                elif crop_position == "left":
+                    x = 0
+                    y = (old_height - crop_h) // 2
+                elif crop_position == "right":
+                    x = old_width - crop_w
+                    y = (old_height - crop_h) // 2
+                out_image = out_image.narrow(-2, x, crop_w).narrow(-3, y, crop_h)
+                if out_mask is not None:
+                    out_mask = out_mask.narrow(-1, x, crop_w).narrow(-2, y, crop_h)
+
+            out_image = common_upscale(out_image.movedim(-1,1), width, height, upscale_method, crop="disabled").movedim(1,-1)
+            if out_mask is not None:
+                if upscale_method == "lanczos":
+                    out_mask = common_upscale(out_mask.unsqueeze(1).repeat(1, 3, 1, 1), width, height, upscale_method, crop="disabled").movedim(1,-1)[:, :, :, 0]
+                else:
+                    out_mask = common_upscale(out_mask.unsqueeze(1), width, height, upscale_method, crop="disabled").squeeze(1)
+
+            # Pad logic
+            if (keep_proportion.startswith("pad") or pillarbox_blur) and (pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0):
                 padded_width = width + pad_left + pad_right
                 padded_height = height + pad_top + pad_bottom
                 if divisible_by > 1:
@@ -2590,23 +2917,60 @@ highest dimension.
                     if height_remainder > 0:
                         extra_height = divisible_by - height_remainder
                         pad_bottom += extra_height
-                out_image, _ = ImagePadKJ.pad(self, out_image, pad_left, pad_right, pad_top, pad_bottom, 0, pad_color, "edge" if keep_proportion == "pad_edge" else "color")
+
+                pad_mode = (
+                    "pillarbox_blur" if pillarbox_blur else
+                    "edge" if keep_proportion == "pad_edge" else
+                    "edge_pixel" if keep_proportion == "pad_edge_pixel" else
+                    "color"
+                )
+                out_image, out_mask = ImagePadKJ.pad(self, out_image, pad_left, pad_right, pad_top, pad_bottom, 0, pad_color, pad_mode, mask=out_mask)
+
+            return out_image, out_mask
+
+        # If batching disabled (per_batch==0) or batch fits, process whole batch
+        if per_batch == 0 or B <= per_batch:
+            out_image, out_mask = _process_subbatch(image, mask, pad_left, pad_right, pad_top, pad_bottom)
+        else:
+            chunks = []
+            mask_chunks = [] if mask is not None else None
+            total_batches = (B + per_batch - 1) // per_batch
+            current_batch = 0
+            for start_idx in range(0, B, per_batch):
+                current_batch += 1
+                end_idx = min(start_idx + per_batch, B)
+                sub_img = image[start_idx:end_idx]
+                sub_mask = mask[start_idx:end_idx] if mask is not None else None
+                sub_out_img, sub_out_mask = _process_subbatch(sub_img, sub_mask, pad_left, pad_right, pad_top, pad_bottom)
+                chunks.append(sub_out_img.cpu())
                 if mask is not None:
-                    out_mask = out_mask.unsqueeze(1).repeat(1, 3, 1, 1).movedim(1,-1)
-                    out_mask, _ = ImagePadKJ.pad(self, out_mask, pad_left, pad_right, pad_top, pad_bottom, 0, pad_color, "edge" if keep_proportion == "pad_edge" else "color")
-                    out_mask = out_mask[:, :, :, 0]
+                    mask_chunks.append(sub_out_mask.cpu() if sub_out_mask is not None else None)
+                # Per-batch progress update
+                if unique_id and PromptServer is not None:
+                    try:
+                        PromptServer.instance.send_progress_text(
+                            f"<tr><td>Resize v2</td><td>batch {current_batch}/{total_batches} · images {end_idx}/{B}</td></tr>",
+                            unique_id
+                        )
+                    except:
+                        pass
                 else:
-                    B, H_pad, W_pad, _ = out_image.shape
-                    out_mask = torch.ones((B, H_pad, W_pad), dtype=out_image.dtype, device=out_image.device)
-                    out_mask[:, pad_top:pad_top+height, pad_left:pad_left+width] = 0.0
+                    try:
+                        logging.info(f"[ImageResizeKJv2] batch {current_batch}/{total_batches} · images {end_idx}/{B}")
+                    except:
+                        pass
+            out_image = torch.cat(chunks, dim=0)
+            if mask is not None and any(m is not None for m in mask_chunks):
+                out_mask = torch.cat([m for m in mask_chunks if m is not None], dim=0)
+            else:
+                out_mask = None
 
-
+        # Progress UI
         if unique_id and PromptServer is not None:
             try:
                 num_elements = out_image.numel()
                 element_size = out_image.element_size()
                 memory_size_mb = (num_elements * element_size) / (1024 * 1024)
-                
                 PromptServer.instance.send_progress_text(
                     f"<tr><td>Output: </td><td><b>{out_image.shape[0]}</b> x <b>{out_image.shape[2]}</b> x <b>{out_image.shape[1]} | {memory_size_mb:.2f}MB</b></td></tr>",
                     unique_id
@@ -2614,9 +2978,8 @@ highest dimension.
             except:
                 pass
 
-        return(out_image.cpu(), out_image.shape[2], out_image.shape[1], out_mask.cpu() if out_mask is not None else torch.zeros(64,64, device=torch.device("cpu"), dtype=torch.float32))
-    
-import pathlib    
+        return (out_image.cpu(), out_image.shape[2], out_image.shape[1], out_mask.cpu() if out_mask is not None else torch.zeros(64,64, device=torch.device("cpu"), dtype=torch.float32))
+
 class LoadAndResizeImage:
     _color_channels = ["alpha", "red", "green", "blue"]
     @classmethod
@@ -2643,30 +3006,22 @@ class LoadAndResizeImage:
     FUNCTION = "load_image"
 
     def load_image(self, image, resize, width, height, repeat, keep_proportion, divisible_by, mask_channel, background_color):
-        from PIL import ImageColor, Image, ImageOps, ImageSequence
-        import numpy as np
-        import torch
         image_path = folder_paths.get_annotated_filepath(image)
-        
-        import node_helpers
+
         img = node_helpers.pillow(Image.open, image_path)
+        img = ImageOps.exif_transpose(img)
 
-        # Process the background_color
+        # Process the background_color using the helper function
         if background_color:
-            try:
-                # Try to parse as RGB tuple
-                bg_color_rgba = tuple(int(x.strip()) for x in background_color.split(','))
-            except ValueError:
-                # If parsing fails, it might be a hex color or named color
-                if background_color.startswith('#') or background_color.lower() in ImageColor.colormap:
-                    bg_color_rgba = ImageColor.getrgb(background_color)
-                else:
-                    raise ValueError(f"Invalid background color: {background_color}")
-
-            bg_color_rgba += (255,)  # Add alpha channel
+            color_list = string_to_color(background_color)
+            # Ensure we have RGBA (add alpha if only RGB)
+            if len(color_list) == 3:
+                bg_color_rgba = tuple(color_list) + (255,)
+            else:
+                bg_color_rgba = tuple(color_list)
         else:
             bg_color_rgba = None  # No background color specified
-        
+
         output_images = []
         output_masks = []
         w, h = None, None
@@ -2770,14 +3125,15 @@ class LoadAndResizeImage:
 
         return True
 
-import hashlib
 class LoadImagesFromFolderKJ:
     # Dictionary to store folder hashes
     folder_hashes = {}
 
     @classmethod
     def IS_CHANGED(cls, folder, **kwargs):
-        if not os.path.isdir(folder):
+        if folder and not os.path.isabs(folder) and args.base_directory:
+            folder = os.path.join(args.base_directory, folder)
+        if not folder or not os.path.isdir(folder):
             return float("NaN")
         
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tga']
@@ -2795,7 +3151,7 @@ class LoadImagesFromFolderKJ:
                         except OSError:
                             pass
         else:
-            for file in os.listdir(folder):
+            for file in sorted(os.listdir(folder)):
                 if any(file.lower().endswith(ext) for ext in valid_extensions):
                     path = os.path.join(folder, file)
                     try:
@@ -2845,9 +3201,11 @@ class LoadImagesFromFolderKJ:
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """Loads images from a folder into a batch, images are resized and loaded into a batch."""
 
-    def load_images(self, folder, width, height, image_load_cap, start_index, keep_aspect_ratio, include_subfolders=False):
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(f"Folder '{folder} cannot be found.'")
+    def load_images(self, folder, width, height, image_load_cap, start_index, keep_aspect_ratio, include_subfolders=False):    
+        if folder and not os.path.isabs(folder) and args.base_directory:
+            folder = os.path.join(args.base_directory, folder)
+        if not folder or not os.path.isdir(folder):
+            raise FileNotFoundError(f"Folder '{folder}' cannot be found.")
         
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tga']
         image_paths = []
@@ -2857,7 +3215,7 @@ class LoadImagesFromFolderKJ:
                     if any(file.lower().endswith(ext) for ext in valid_extensions):
                         image_paths.append(os.path.join(root, file))
         else:
-            for file in os.listdir(folder):
+            for file in sorted(os.listdir(folder)):
                 if any(file.lower().endswith(ext) for ext in valid_extensions):
                     image_paths.append(os.path.join(folder, file))
 
@@ -2877,6 +3235,8 @@ class LoadImagesFromFolderKJ:
         if image_load_cap > 0:
             limit_images = True
         image_count = 0
+
+        pbar = ProgressBar(len(dir_files))
 
         for image_path in dir_files:
             if os.path.isdir(image_path):
@@ -2913,6 +3273,7 @@ class LoadImagesFromFolderKJ:
             masks.append(mask)
             image_path_list.append(image_path)
             image_count += 1
+            pbar.update(1)
 
         if len(images) == 1:
             return (images[0], masks[0], 1, image_path_list)
@@ -2971,7 +3332,6 @@ class LoadImagesFromFolderKJ:
                 padded.paste(img, (padding, 0))
                 return padded
     def get_edge_color(self, img):
-        from PIL import ImageStat
         """Sample edges and return dominant color"""
         width, height = img.size
         img = img.convert('RGBA')
@@ -2993,7 +3353,6 @@ class LoadImagesFromFolderKJ:
         stat = ImageStat.Stat(edges)
         median = tuple(map(int, stat.median))
         return median
-        
 
 class ImageGridtoBatch:
     @classmethod
@@ -3004,37 +3363,37 @@ class ImageGridtoBatch:
                     "rows": ("INT", {"default": 0, "min": 1, "max": 8, "tooltip": "The number of rows in the grid. Set to 0 for automatic calculation."}),
                   }
                 }
-    
+
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decompose"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = "Converts a grid of images to a batch of images."
-        
+
     def decompose(self, image, columns, rows):
         B, H, W, C = image.shape
-        print("input size: ", image.shape)
-        
+
         # Calculate cell width, rounding down
         cell_width = W // columns
-        
+
         if rows == 0:
             # If rows is 0, calculate number of full rows
+            cell_height = H // columns
             rows = H // cell_height
         else:
             # If rows is specified, adjust cell_height
             cell_height = H // rows
-        
+
         # Crop the image to fit full cells
         image = image[:, :rows*cell_height, :columns*cell_width, :]
-        
+
         # Reshape and permute the image to get the grid
         image = image.view(B, rows, cell_height, columns, cell_width, C)
         image = image.permute(0, 1, 3, 2, 4, 5).contiguous()
         image = image.view(B, rows * columns, cell_height, cell_width, C)
-        
+
         # Reshape to the final batch tensor
         img_tensor = image.view(-1, cell_height, cell_width, C)
-        
+
         return (img_tensor,)
 
 class SaveImageKJ:
@@ -3106,7 +3465,7 @@ class SaveImageKJ:
             if caption is not None:
                 txt_file = base_file_name + caption_file_extension
                 file_path = os.path.join(full_output_folder, txt_file)
-                with open(file_path, 'w') as f:
+                with open(file_path, "w", encoding="utf-8") as f:
                     f.write(caption)
 
             counter += 1
@@ -3144,8 +3503,10 @@ class SaveStringKJ:
 
     def save_string(self, string, output_folder, filename_prefix="text", file_extension=".txt"):
         filename_prefix += self.prefix_append
-        
+
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+        if output_folder and not os.path.isabs(output_folder) and args.base_directory:
+            output_folder = os.path.join(args.base_directory, output_folder)
         if output_folder != "output":
             if not os.path.exists(output_folder):
                 os.makedirs(output_folder, exist_ok=True)
@@ -3156,7 +3517,7 @@ class SaveStringKJ:
 
         txt_file = base_file_name + file_extension
         file_path = os.path.join(full_output_folder, txt_file)
-        with open(file_path, 'w') as f:
+        with open(file_path, 'w', encoding="utf-8") as f:
             f.write(string)
 
         return results,
@@ -3183,7 +3544,7 @@ class FastPreview:
     def preview(self, image, format, quality):        
         pil_image = to_pil_image(image[0].permute(2, 0, 1))
 
-        with io.BytesIO() as buffered:
+        with BytesIO() as buffered:
             pil_image.save(buffered, format=format, quality=quality)
             img_bytes = buffered.getvalue()
 
@@ -3205,7 +3566,6 @@ class ImageCropByMaskAndResize:
                 "padding": ("INT", { "default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                 "min_crop_resolution": ("INT", { "default": 128, "min": 0, "max": MAX_RESOLUTION, "step": 8, }),
                 "max_crop_resolution": ("INT", { "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 8, }),
-           
             },
         }
 
@@ -3215,9 +3575,14 @@ class ImageCropByMaskAndResize:
     CATEGORY = "KJNodes/image"
 
     def crop_by_mask(self, mask, padding=0, min_crop_resolution=None, max_crop_resolution=None):
+        """
+        Calculate bounding box from mask with proper padding boundary protection
+        Ensures crop region never exceeds original image boundaries
+        """
         iy, ix = (mask == 1).nonzero(as_tuple=True)
         h0, w0 = mask.shape
 
+        # Handle empty mask
         if iy.numel() == 0:
             x_c = w0 / 2.0
             y_c = h0 / 2.0
@@ -3228,51 +3593,49 @@ class ImageCropByMaskAndResize:
             x_max = ix.max().item()
             y_min = iy.min().item()
             y_max = iy.max().item()
-
-            width = x_max - x_min
-            height = y_max - y_min
-
-            if width > w0 or height > h0:
-                raise Exception("Masked area out of bounds")
-
+            width = x_max - x_min + 1  # Include boundary pixels
+            height = y_max - y_min + 1
             x_c = (x_min + x_max) / 2.0
             y_c = (y_min + y_max) / 2.0
 
+        # Apply min/max resolution constraints
         if min_crop_resolution:
             width = max(width, min_crop_resolution)
             height = max(height, min_crop_resolution)
-
         if max_crop_resolution:
             width = min(width, max_crop_resolution)
             height = min(height, max_crop_resolution)
 
-        if w0 <= width:
-            x0 = 0
-            w = w0
-        else:
-            x0 = max(0, x_c - width / 2 - padding)
-            w = width + 2 * padding
-            if x0 + w > w0:
-                x0 = w0 - w
+        # Critical: Limit padding expansion to available image space
+        # Calculate maximum possible padding for each direction
+        max_padding_x = min((w0 - width) // 2, padding)
+        max_padding_y = min((h0 - height) // 2, padding)
+        
+        # Apply constrained padding
+        final_width = width + 2 * max_padding_x
+        final_height = height + 2 * max_padding_y
 
-        if h0 <= height:
-            y0 = 0
-            h = h0
-        else:
-            y0 = max(0, y_c - height / 2 - padding)
-            h = height + 2 * padding
-            if y0 + h > h0:
-                y0 = h0 - h
+        # Ensure final dimensions don't exceed image bounds
+        final_width = min(final_width, w0)
+        final_height = min(final_height, h0)
 
-        return (int(x0), int(y0), int(w), int(h))
+        # Calculate top-left corner with boundary protection
+        # Center the crop while respecting image boundaries
+        x0 = max(0, min(int(x_c - final_width / 2), w0 - final_width))
+        y0 = max(0, min(int(y_c - final_height / 2), h0 - final_height))
+
+        return (x0, y0, final_width, final_height)
 
     def crop(self, image, mask, base_resolution, padding=0, min_crop_resolution=128, max_crop_resolution=512):
+        """
+        Main crop and resize function with uniform target dimensions for all batch items
+        """
         mask = mask.round()
         image_list = []
         mask_list = []
         bbox_list = []
 
-        # First, collect all bounding boxes
+        # Step 1: Calculate individual bounding boxes
         bbox_params = []
         aspect_ratios = []
         for i in range(image.shape[0]):
@@ -3280,15 +3643,16 @@ class ImageCropByMaskAndResize:
             bbox_params.append((x0, y0, w, h))
             aspect_ratios.append(w / h)
 
-        # Find maximum width and height
+        # Step 2: Calculate uniform target dimensions based on maximum aspect ratio
         max_w = max([w for x0, y0, w, h in bbox_params])
         max_h = max([h for x0, y0, w, h in bbox_params])
         max_aspect_ratio = max(aspect_ratios)
 
-        # Ensure dimensions are divisible by 16
+        # Round up to nearest multiple of 16 for stable processing
         max_w = (max_w + 15) // 16 * 16
         max_h = (max_h + 15) // 16 * 16
-        # Calculate common target dimensions
+
+        # Determine target dimensions maintaining aspect ratio
         if max_aspect_ratio > 1:
             target_width = base_resolution
             target_height = int(base_resolution / max_aspect_ratio)
@@ -3296,31 +3660,36 @@ class ImageCropByMaskAndResize:
             target_height = base_resolution
             target_width = int(base_resolution * max_aspect_ratio)
 
+        # Ensure target dimensions are multiples of 16
+        target_width = (target_width + 15) // 16 * 16
+        target_height = (target_height + 15) // 16 * 16
+
+        # Step 3: Process each image with uniform crop size
         for i in range(image.shape[0]):
-            x0, y0, w, h = bbox_params[i]
+            orig_x0, orig_y0, orig_w, orig_h = bbox_params[i]
+            
+            # Calculate center of original bounding box
+            x_center = orig_x0 + orig_w / 2
+            y_center = orig_y0 + orig_h / 2
 
-            # Adjust cropping to use maximum width and height
-            x_center = x0 + w / 2
-            y_center = y0 + h / 2
+            # Define uniform crop region centered on each image's bounding box
+            # This ensures all crops have exactly the same dimensions
+            x0_new = max(0, min(int(x_center - max_w / 2), image.shape[2] - max_w))
+            y0_new = max(0, min(int(y_center - max_h / 2), image.shape[1] - max_h))
+            x1_new = x0_new + max_w
+            y1_new = y0_new + max_h
 
-            x0_new = int(max(0, x_center - max_w / 2))
-            y0_new = int(max(0, y_center - max_h / 2))
-            x1_new = int(min(x0_new + max_w, image.shape[2]))
-            y1_new = int(min(y0_new + max_h, image.shape[1]))
-            x0_new = x1_new - max_w
-            y0_new = y1_new - max_h
-
+            # Extract cropped regions
             cropped_image = image[i][y0_new:y1_new, x0_new:x1_new, :]
             cropped_mask = mask[i][y0_new:y1_new, x0_new:x1_new]
-            
-            # Ensure dimensions are divisible by 16
-            target_width = (target_width + 15) // 16 * 16
-            target_height = (target_height + 15) // 16 * 16
 
-            cropped_image = cropped_image.unsqueeze(0).movedim(-1, 1)  # Move C to the second position (B, C, H, W)
+            # Resize to exact target dimensions
+            # Image with lanczos interpolation
+            cropped_image = cropped_image.unsqueeze(0).movedim(-1, 1)
             cropped_image = common_upscale(cropped_image, target_width, target_height, "lanczos", "disabled")
             cropped_image = cropped_image.movedim(1, -1).squeeze(0)
 
+            # Mask with bilinear interpolation
             cropped_mask = cropped_mask.unsqueeze(0).unsqueeze(0)
             cropped_mask = common_upscale(cropped_mask, target_width, target_height, 'bilinear', "disabled")
             cropped_mask = cropped_mask.squeeze(0).squeeze(0)
@@ -3328,7 +3697,6 @@ class ImageCropByMaskAndResize:
             image_list.append(cropped_image)
             mask_list.append(cropped_mask)
             bbox_list.append((x0_new, y0_new, x1_new, y1_new))
-
 
         return (torch.stack(image_list), torch.stack(mask_list), bbox_list)
     
@@ -3446,7 +3814,7 @@ class ImageCropByMaskBatch:
                     "height": ("INT", {"default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 8, }),
                     "padding": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1, }),
                     "preserve_size": ("BOOLEAN", {"default": False}),
-                    "bg_color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255, separated by commas."}),
+                    "bg_color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255 or 0.0-1.0, or color name or hex code"}),
                   }
                 }
     
@@ -3462,11 +3830,12 @@ class ImageCropByMaskBatch:
         mask_count = BM
         if HM != H or WM != W:
             masks = F.interpolate(masks.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
-            print(masks.shape)
         output_images = []
         output_masks = []
 
-        bg_color = [int(x.strip())/255.0 for x in bg_color.split(",")]
+        # Parse background color using helper function
+        color_list = string_to_color(bg_color)
+        bg_color = [x / 255.0 for x in color_list]
         
         # For each mask
         for i in range(mask_count):
@@ -3548,8 +3917,8 @@ class ImagePadKJ:
                     "top": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                     "bottom": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                     "extra_padding": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
-                    "pad_mode": (["edge", "color"],),
-                    "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255, separated by commas."}),
+                    "pad_mode": (["edge", "edge_pixel", "color", "pillarbox_blur"],),
+                    "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255 or 0.0-1.0, or color name or hex code"}),
                   },
                 "optional": {
                     "mask": ("MASK", ),
@@ -3566,19 +3935,19 @@ class ImagePadKJ:
         
     def pad(self, image, left, right, top, bottom, extra_padding, color, pad_mode, mask=None, target_width=None, target_height=None):
         B, H, W, C = image.shape
-        
         # Resize masks to image dimensions if necessary
         if mask is not None:
             BM, HM, WM = mask.shape
             if HM != H or WM != W:
                 mask = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
 
-        # Parse background color
-        bg_color = [int(x.strip())/255.0 for x in color.split(",")]
+        # Parse background color using helper function
+        color_list = string_to_color(color)
+        bg_color = [x / 255.0 for x in color_list]
         if len(bg_color) == 1:
             bg_color = bg_color * 3  # Grayscale to RGB
         bg_color = torch.tensor(bg_color, dtype=image.dtype, device=image.device)
-        
+
         # Calculate padding sizes with extra padding
         if target_width is not None and target_height is not None:
             if extra_padding > 0:
@@ -3599,30 +3968,104 @@ class ImagePadKJ:
 
             padded_width = W + pad_left + pad_right
             padded_height = H + pad_top + pad_bottom
-        out_image = torch.zeros((B, padded_height, padded_width, C), dtype=image.dtype, device=image.device)
-        
-        # Fill padded areas
-        for b in range(B):
-            if pad_mode == "edge":
-                # Pad with edge color
-                # Define edge pixels
-                top_edge = image[b, 0, :, :]
-                bottom_edge = image[b, H-1, :, :]
-                left_edge = image[b, :, 0, :]
-                right_edge = image[b, :, W-1, :]
 
-                # Fill borders with edge colors
-                out_image[b, :pad_top, :, :] = top_edge.mean(dim=0)
-                out_image[b, pad_top+H:, :, :] = bottom_edge.mean(dim=0)
-                out_image[b, :, :pad_left, :] = left_edge.mean(dim=0)
-                out_image[b, :, pad_left+W:, :] = right_edge.mean(dim=0)
-                out_image[b, pad_top:pad_top+H, pad_left:pad_left+W, :] = image[b]
+        # Pillarbox blur mode
+        if pad_mode == "pillarbox_blur":
+            def _gaussian_blur_nchw(img_nchw, sigma_px):
+                if sigma_px <= 0:
+                    return img_nchw
+                radius = max(1, int(3.0 * float(sigma_px)))
+                k = 2 * radius + 1
+                x = torch.arange(-radius, radius + 1, device=img_nchw.device, dtype=img_nchw.dtype)
+                k1 = torch.exp(-(x * x) / (2.0 * float(sigma_px) * float(sigma_px)))
+                k1 = k1 / k1.sum()
+                kx = k1.view(1, 1, 1, k)
+                ky = k1.view(1, 1, k, 1)
+                c = img_nchw.shape[1]
+                kx = kx.repeat(c, 1, 1, 1)
+                ky = ky.repeat(c, 1, 1, 1)
+                img_nchw = F.conv2d(img_nchw, kx, padding=(0, radius), groups=c)
+                img_nchw = F.conv2d(img_nchw, ky, padding=(radius, 0), groups=c)
+                return img_nchw
+
+            out_image = torch.zeros((B, padded_height, padded_width, C), dtype=image.dtype, device=image.device)
+            for b in range(B):
+                scale_fill = max(padded_width / float(W), padded_height / float(H)) if (W > 0 and H > 0) else 1.0
+                bg_w = max(1, int(round(W * scale_fill)))
+                bg_h = max(1, int(round(H * scale_fill)))
+                src_b = image[b].movedim(-1, 0).unsqueeze(0)
+                bg = common_upscale(src_b, bg_w, bg_h, "bilinear", crop="disabled")
+                y0 = max(0, (bg_h - padded_height) // 2)
+                x0 = max(0, (bg_w - padded_width) // 2)
+                y1 = min(bg_h, y0 + padded_height)
+                x1 = min(bg_w, x0 + padded_width)
+                bg = bg[:, :, y0:y1, x0:x1]
+                if bg.shape[2] != padded_height or bg.shape[3] != padded_width:
+                    pad_h = padded_height - bg.shape[2]
+                    pad_w = padded_width - bg.shape[3]
+                    pad_top_fix = max(0, pad_h // 2)
+                    pad_bottom_fix = max(0, pad_h - pad_top_fix)
+                    pad_left_fix = max(0, pad_w // 2)
+                    pad_right_fix = max(0, pad_w - pad_left_fix)
+                    bg = F.pad(bg, (pad_left_fix, pad_right_fix, pad_top_fix, pad_bottom_fix), mode="replicate")
+                sigma = max(1.0, 0.006 * float(min(padded_height, padded_width)))
+                bg = _gaussian_blur_nchw(bg, sigma_px=sigma)
+                if C >= 3:
+                    r, g, bch = bg[:, 0:1], bg[:, 1:2], bg[:, 2:3]
+                    luma = 0.2126 * r + 0.7152 * g + 0.0722 * bch
+                    gray = torch.cat([luma, luma, luma], dim=1)
+                    desat = 0.20
+                    rgb = torch.cat([r, g, bch], dim=1)
+                    rgb = rgb * (1.0 - desat) + gray * desat
+                    bg[:, 0:3, :, :] = rgb
+                dim = 0.35
+                bg = torch.clamp(bg * dim, 0.0, 1.0)
+                out_image[b] = bg.squeeze(0).movedim(0, -1)
+            out_image[:, pad_top:pad_top+H, pad_left:pad_left+W, :] = image
+            # Mask handling for pillarbox_blur
+            if mask is not None:
+                fg_mask = mask
+                out_masks = torch.ones((B, padded_height, padded_width), dtype=image.dtype, device=image.device)
+                out_masks[:, pad_top:pad_top+H, pad_left:pad_left+W] = fg_mask
             else:
-                # Pad with specified background color
-                out_image[b, :, :, :] = bg_color.unsqueeze(0).unsqueeze(0)  # Expand for H and W dimensions
-                out_image[b, pad_top:pad_top+H, pad_left:pad_left+W, :] = image[b]
+                out_masks = torch.ones((B, padded_height, padded_width), dtype=image.dtype, device=image.device)
+                out_masks[:, pad_top:pad_top+H, pad_left:pad_left+W] = 0.0
+            return (out_image, out_masks)
 
-        
+        # Standard pad logic (edge/color)
+        out_image = torch.zeros((B, padded_height, padded_width, C), dtype=image.dtype, device=image.device)
+        for b in range(B):
+                if pad_mode == "edge":
+                    # Pad with edge color (mean)
+                    top_edge = image[b, 0, :, :]
+                    bottom_edge = image[b, H-1, :, :]
+                    left_edge = image[b, :, 0, :]
+                    right_edge = image[b, :, W-1, :]
+                    out_image[b, :pad_top, :, :] = top_edge.mean(dim=0)
+                    out_image[b, pad_top+H:, :, :] = bottom_edge.mean(dim=0)
+                    out_image[b, :, :pad_left, :] = left_edge.mean(dim=0)
+                    out_image[b, :, pad_left+W:, :] = right_edge.mean(dim=0)
+                    out_image[b, pad_top:pad_top+H, pad_left:pad_left+W, :] = image[b]
+                elif pad_mode == "edge_pixel":
+                    # Pad with exact edge pixel values
+                    for y in range(pad_top):
+                        out_image[b, y, pad_left:pad_left+W, :] = image[b, 0, :, :]
+                    for y in range(pad_top+H, padded_height):
+                        out_image[b, y, pad_left:pad_left+W, :] = image[b, H-1, :, :]
+                    for x in range(pad_left):
+                        out_image[b, pad_top:pad_top+H, x, :] = image[b, :, 0, :]
+                    for x in range(pad_left+W, padded_width):
+                        out_image[b, pad_top:pad_top+H, x, :] = image[b, :, W-1, :]
+                    out_image[b, :pad_top, :pad_left, :] = image[b, 0, 0, :]
+                    out_image[b, :pad_top, pad_left+W:, :] = image[b, 0, W-1, :]
+                    out_image[b, pad_top+H:, :pad_left, :] = image[b, H-1, 0, :]
+                    out_image[b, pad_top+H:, pad_left+W:, :] = image[b, H-1, W-1, :]
+                    out_image[b, pad_top:pad_top+H, pad_left:pad_left+W, :] = image[b]
+                else:
+                    # Pad with specified background color
+                    out_image[b, :, :, :] = bg_color.unsqueeze(0).unsqueeze(0)
+                    out_image[b, pad_top:pad_top+H, pad_left:pad_left+W, :] = image[b]
+
         if mask is not None:
             out_masks = torch.nn.functional.pad(
                 mask, 
@@ -3635,3 +4078,156 @@ class ImagePadKJ:
                 out_masks[m, pad_top:pad_top+H, pad_left:pad_left+W] = 0.0
 
         return (out_image, out_masks)
+
+# extends https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+class LoadVideosFromFolder:
+    @classmethod
+    def __init__(cls):
+        try:
+            cls.vhs_nodes = importlib.import_module("ComfyUI-VideoHelperSuite.videohelpersuite")
+        except ImportError:
+            try:
+                cls.vhs_nodes = importlib.import_module("comfyui-videohelpersuite.videohelpersuite")
+            except ImportError:
+                # Fallback to sys.modules search for Windows compatibility
+                import sys
+                vhs_module = None
+                for module_name in sys.modules:
+                    if 'videohelpersuite' in module_name and 'videohelpersuite' in sys.modules[module_name].__dict__:
+                        vhs_module = sys.modules[module_name]
+                        break
+                
+                if vhs_module is None:
+                    # Try direct access to the videohelpersuite submodule
+                    for module_name in sys.modules:
+                        if module_name.endswith('videohelpersuite'):
+                            vhs_module = sys.modules[module_name]
+                            break
+                
+                if vhs_module is not None:
+                    cls.vhs_nodes = vhs_module
+                else:
+                    raise ImportError("This node requires ComfyUI-VideoHelperSuite to be installed.")
+                
+        except ImportError:
+            raise ImportError("This node requires ComfyUI-VideoHelperSuite to be installed.")
+          
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("STRING", {"default": "X://insert/path/"},),
+                "force_rate": ("FLOAT", {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096, 'disable': 0}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096, 'disable': 0}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "disable": 0}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
+                "output_type": (["batch", "grid"], {"default": "batch"}),
+                "grid_max_columns": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1, "disable": 1}),
+                "add_label": ( "BOOLEAN", {"default": False} ),
+            },
+            "hidden": {
+                "force_size": "STRING",
+                "unique_id": "UNIQUE_ID"
+            },
+        }
+
+    CATEGORY = "KJNodes/misc"
+
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("IMAGE", )
+
+    FUNCTION = "load_video"
+
+    def load_video(self, output_type, grid_max_columns, add_label=False, **kwargs):
+        if kwargs.get('video') and not os.path.isabs(kwargs['video']) and args.base_directory:
+            kwargs['video'] = os.path.join(args.base_directory, kwargs['video'])
+            
+        if self.vhs_nodes is None:
+            raise ImportError("This node requires ComfyUI-VideoHelperSuite to be installed.")
+        videos_list = []
+        filenames = []
+        for f in sorted(os.listdir(kwargs['video'])):
+            if os.path.isfile(os.path.join(kwargs['video'], f)):
+                file_parts = f.split('.')
+                if len(file_parts) > 1 and (file_parts[-1].lower() in ['webm', 'mp4', 'mkv', 'gif', 'mov']):
+                    videos_list.append(os.path.join(kwargs['video'], f))
+                    filenames.append(f)
+
+        kwargs.pop('video')
+        loaded_videos = []
+        for idx, video in enumerate(videos_list):
+            video_tensor = self.vhs_nodes.load_video_nodes.load_video(video=video, **kwargs)[0]
+            if add_label:
+                # Add filename label above video (without extension)
+                if video_tensor.dim() == 4:
+                    _, h, w, c = video_tensor.shape
+                else:
+                    h, w, c = video_tensor.shape
+                # Remove extension from filename
+                label_text = filenames[idx].rsplit('.', 1)[0]
+                font_size = max(16, w // 20)
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    font = ImageFont.load_default()
+                dummy_img = Image.new("RGB", (w, 10), (0,0,0))
+                draw = ImageDraw.Draw(dummy_img)
+                text_bbox = draw.textbbox((0,0), label_text, font=font)
+                extra_padding = max(12, font_size // 2)  # More padding under the font
+                label_height = text_bbox[3] - text_bbox[1] + extra_padding
+                label_img = Image.new("RGB", (w, label_height), (0,0,0))
+                draw = ImageDraw.Draw(label_img)
+                draw.text((w//2 - (text_bbox[2]-text_bbox[0])//2, 4), label_text, font=font, fill=(255,255,255))
+                label_np = np.asarray(label_img).astype(np.float32) / 255.0
+                label_tensor = torch.from_numpy(label_np)
+                if c == 1:
+                    label_tensor = label_tensor.mean(dim=2, keepdim=True)
+                elif c == 4:
+                    alpha = torch.ones((label_height, w, 1), dtype=label_tensor.dtype)
+                    label_tensor = torch.cat([label_tensor, alpha], dim=2)
+                if video_tensor.dim() == 4:
+                    label_tensor = label_tensor.unsqueeze(0).expand(video_tensor.shape[0], -1, -1, -1)
+                    video_tensor = torch.cat([label_tensor, video_tensor], dim=1)
+                else:
+                    video_tensor = torch.cat([label_tensor, video_tensor], dim=0)
+            loaded_videos.append(video_tensor)
+        if output_type == "batch":
+            out_tensor = torch.cat(loaded_videos)
+        elif output_type == "grid":
+            rows = (len(loaded_videos) + grid_max_columns - 1) // grid_max_columns
+            # Pad the last row if needed
+            total_slots = rows * grid_max_columns
+            while len(loaded_videos) < total_slots:
+                loaded_videos.append(torch.zeros_like(loaded_videos[0]))
+            # Create grid by rows
+            row_tensors = []
+            for row_idx in range(rows):
+                start_idx = row_idx * grid_max_columns
+                end_idx = start_idx + grid_max_columns
+                row_videos = loaded_videos[start_idx:end_idx]
+                # Pad all videos in this row to the same height
+                heights = [v.shape[1] for v in row_videos]
+                max_height = max(heights)
+                padded_row_videos = []
+                for v in row_videos:
+                    pad_height = max_height - v.shape[1]
+                    if pad_height > 0:
+                        # Pad (frames, H, W, C) or (H, W, C)
+                        if v.dim() == 4:
+                            pad = (0,0, 0,0, 0,pad_height, 0,0)  # (C,W,H,F)
+                            v = torch.nn.functional.pad(v, (0,0,0,0,0,pad_height,0,0))
+                        else:
+                            v = torch.nn.functional.pad(v, (0,0,0,0,pad_height,0))
+                    padded_row_videos.append(v)
+                row_tensor = torch.cat(padded_row_videos, dim=2)  # Concatenate horizontally
+                row_tensors.append(row_tensor)
+            out_tensor = torch.cat(row_tensors, dim=1)  # Concatenate rows vertically
+        return out_tensor,
+
+    @classmethod
+    def IS_CHANGED(s, video, **kwargs):
+        if s.vhs_nodes is not None:
+            return s.vhs_nodes.utils.hash_path(video)
+        return None

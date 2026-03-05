@@ -6,6 +6,8 @@ import scipy.ndimage
 import numpy as np
 from contextlib import nullcontext
 import os
+from tqdm import tqdm
+import logging
 
 from comfy import model_management
 from comfy.utils import ProgressBar
@@ -17,6 +19,8 @@ import folder_paths
 from ..utility.utility import tensor2pil, pil2tensor
 
 script_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+main_device = model_management.get_torch_device()
+offload_device = model_management.unet_offload_device()
 
 class BatchCLIPSeg:
 
@@ -98,7 +102,7 @@ Segments an image or batch of images using CLIPSeg.
         mask_tensor = torch.sigmoid(outputs.logits)
         mask_tensor = (mask_tensor - mask_tensor.min()) / (mask_tensor.max() - mask_tensor.min())
         mask_tensor = torch.where(mask_tensor > (threshold), mask_tensor, torch.tensor(0, dtype=torch.float))
-        print(mask_tensor.shape)
+
         if len(mask_tensor.shape) == 2:
             mask_tensor = mask_tensor.unsqueeze(0)
         mask_tensor = F.interpolate(mask_tensor.unsqueeze(1), size=(H, W), mode='nearest')
@@ -228,40 +232,34 @@ creates animation between them.
             image = Image.new("RGB", (width, height), "black")
             draw = ImageDraw.Draw(image)
             font = ImageFont.truetype(font_path, font_size)
-            
-            # Split the text into words
-            words = text.split()
-            
-            # Initialize variables for line creation
+
+            # Split the text into lines and wrap words to fit width
+            text_lines = text.split('\n')
             lines = []
-            current_line = []
-            current_line_width = 0
-            try: #new pillow  
-                # Iterate through words to create lines
+            for text_line in text_lines:
+                if text_line.strip() == "":
+                    # Preserve empty lines for multiple newlines
+                    lines.append("")
+                    continue
+                words = text_line.split()
+                current_line = []
                 for word in words:
-                    word_width = font.getbbox(word)[2]
-                    if current_line_width + word_width <= width - 2 * text_x:
+                    if current_line:
+                        test_line = " ".join(current_line + [word])
+                    else:
+                        test_line = word
+                    try:
+                        test_line_width = font.getbbox(test_line)[2]
+                    except Exception:
+                        test_line_width = font.getsize(test_line)[0]
+                    if test_line_width <= width - 2 * text_x:
                         current_line.append(word)
-                        current_line_width += word_width + font.getbbox(" ")[2] # Add space width
                     else:
                         lines.append(" ".join(current_line))
                         current_line = [word]
-                        current_line_width = word_width
-            except: #old pillow             
-                for word in words:
-                    word_width = font.getsize(word)[0]
-                    if current_line_width + word_width <= width - 2 * text_x:
-                        current_line.append(word)
-                        current_line_width += word_width + font.getsize(" ")[0] # Add space width
-                    else:
-                        lines.append(" ".join(current_line))
-                        current_line = [word]
-                        current_line_width = word_width
-            
-            # Add the last line if it's not empty
-            if current_line:
-                lines.append(" ".join(current_line))
-            
+                if current_line:
+                    lines.append(" ".join(current_line))
+
             # Draw each line of text separately
             y_offset = text_y
             for line in lines:
@@ -274,17 +272,17 @@ creates animation between them.
                 except:
                     draw.text((text_x, y_offset), line, font=font, fill=font_color)
                 y_offset += text_height # Move to the next line
-            
+
             if start_rotation != end_rotation:
                 image = image.rotate(rotation, center=(text_center_x, text_center_y))
                 rotation += rotation_increment
-            
+
             image = np.array(image).astype(np.float32) / 255.0
             image = torch.from_numpy(image)[None,]
             mask = image[:, :, :, 0] 
             masks.append(mask)
             out.append(image)
-            
+
         if invert:
             return (1.0 - torch.cat(out, dim=0), 1.0 - torch.cat(masks, dim=0),)
         return (torch.cat(out, dim=0),torch.cat(masks, dim=0),)
@@ -386,7 +384,7 @@ class CreateFluidMask:
         INFLOW_VELOCITY = inflow_velocity
         INFLOW_COUNT = inflow_count
 
-        print('Generating fluid solver, this may take some time.')
+        logging.info('Generating fluid solver, this may take some time.')
         fluid = Fluid(RESOLUTION, 'dye')
 
         center = np.floor_divide(RESOLUTION, 2)
@@ -406,7 +404,7 @@ class CreateFluidMask:
 
         
         for f in range(DURATION):
-            print(f'Computing frame {f + 1} of {DURATION}.')
+            logging.info(f'Computing frame {f + 1} of {DURATION}.')
             if f <= INFLOW_DURATION:
                 fluid.velocity += inflow_velocity
                 fluid.dye += inflow_dye
@@ -878,6 +876,7 @@ class CreateVoronoiMask:
 
     def createvoronoi(self, frames, num_points, line_width, speed, frame_width, frame_height):
         from scipy.spatial import Voronoi
+        from matplotlib import pyplot as plt
         # Define the number of images in the batch
         batch_size = frames
         out = []
@@ -997,43 +996,55 @@ class GrowMaskWithBlur:
 - fill_holes: fill holes in the mask (slow)"""
     
     def expand_mask(self, mask, expand, tapered_corners, flip_input, blur_radius, incremental_expandrate, lerp_alpha, decay_factor, fill_holes=False):
+        import kornia.morphology as morph
         alpha = lerp_alpha
         decay = decay_factor
         if flip_input:
             mask = 1.0 - mask
-        c = 0 if tapered_corners else 1
-        kernel = np.array([[c, 1, c],
-                           [1, 1, 1],
-                           [c, 1, c]])
-        growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1])).cpu()
+
+        growmask = mask.reshape((-1, mask.shape[-2], mask.shape[-1]))
         out = []
         previous_output = None
         current_expand = expand
-        for m in growmask:
-            output = m.numpy().astype(np.float32)
-            for _ in range(abs(round(current_expand))):
-                if current_expand < 0:
-                    output = scipy.ndimage.grey_erosion(output, footprint=kernel)
+        for m in tqdm(growmask, desc="Expanding/Contracting Mask"):
+            output = m.unsqueeze(0).unsqueeze(0).to(main_device)  # Add batch and channel dims for kornia
+            if abs(round(current_expand)) > 0 and output.max() > 0:
+                # Create kernel - kornia expects kernel on same device as input
+                if tapered_corners:
+                    kernel = torch.tensor([[0, 1, 0],
+                                        [1, 1, 1],
+                                        [0, 1, 0]], dtype=torch.float32, device=output.device)
                 else:
-                    output = scipy.ndimage.grey_dilation(output, footprint=kernel)
+                    kernel = torch.tensor([[1, 1, 1],
+                                        [1, 1, 1],
+                                        [1, 1, 1]], dtype=torch.float32, device=output.device)
+                
+                for _ in range(abs(round(current_expand))):
+                    if current_expand < 0:
+                        output = morph.erosion(output, kernel)
+                    else:
+                        output = morph.dilation(output, kernel)
+            
+            output = output.squeeze(0).squeeze(0)  # Remove batch and channel dims
+            
             if current_expand < 0:
                 current_expand -= abs(incremental_expandrate)
             else:
                 current_expand += abs(incremental_expandrate)
+                
             if fill_holes:
                 binary_mask = output > 0
-                output = scipy.ndimage.binary_fill_holes(binary_mask)
-                output = output.astype(np.float32) * 255
-            output = torch.from_numpy(output)
+                output_np = binary_mask.cpu().numpy()
+                filled = scipy.ndimage.binary_fill_holes(output_np)
+                output = torch.from_numpy(filled.astype(np.float32)).to(output.device)
+            
             if alpha < 1.0 and previous_output is not None:
-                # Interpolate between the previous and current frame
                 output = alpha * output + (1 - alpha) * previous_output
             if decay < 1.0 and previous_output is not None:
-                # Add the decayed previous output to the current frame
                 output += decay * previous_output
                 output = output / output.max()
             previous_output = output
-            out.append(output)
+            out.append(output.cpu())
 
         if blur_radius != 0:
             # Convert the tensor list to PIL images, apply blur, and convert back
@@ -1295,7 +1306,6 @@ def get_mask_polygon(self, mask_np):
     
     return polygon.squeeze()
 
-import cv2
 class SeparateMasks:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1318,6 +1328,7 @@ class SeparateMasks:
     DESCRIPTION = "Separates a mask into multiple masks based on the size of the connected components."
 
     def polygon_to_mask(self, polygon, shape):
+        import cv2
         mask = np.zeros((shape[0], shape[1]), dtype=np.uint8)  # Fixed shape handling
 
         if len(polygon.shape) == 2:  # Check if polygon points are valid
@@ -1326,6 +1337,7 @@ class SeparateMasks:
         return mask
 
     def get_mask_polygon(self, mask_np, max_points):
+        import cv2
         contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
@@ -1335,7 +1347,6 @@ class SeparateMasks:
         
         # Initialize with smaller epsilon for more points
         perimeter = cv2.arcLength(hull, True)
-        epsilon = perimeter * 0.01  # Start smaller
         
         min_eps = perimeter * 0.001  # Much smaller minimum
         max_eps = perimeter * 0.2   # Smaller maximum
@@ -1371,9 +1382,6 @@ class SeparateMasks:
         return best_approx.squeeze() if best_approx is not None else hull.squeeze()
 
     def separate(self, mask: torch.Tensor, size_threshold_width: int, size_threshold_height: int, max_poly_points: int, mode: str):
-        from scipy.ndimage import label, center_of_mass
-        import numpy as np
-        
         B, H, W = mask.shape
         separated = []
 
@@ -1382,7 +1390,7 @@ class SeparateMasks:
         for b in range(B):
             mask_np = mask[b].cpu().numpy().astype(np.uint8)
             structure = np.ones((3, 3), dtype=np.int8)
-            labeled, ncomponents = label(mask_np, structure=structure)
+            labeled, ncomponents = scipy.ndimage.label(mask_np, structure=structure)
             pbar = ProgressBar(ncomponents)
             
             for component in range(1, ncomponents + 1):
@@ -1396,7 +1404,7 @@ class SeparateMasks:
                 width = x_max - x_min + 1
                 height = y_max - y_min + 1
                 centroid_x = (x_min + x_max) / 2  # Calculate x centroid
-                print(f"Component {component}: width={width}, height={height}, x_pos={centroid_x}")
+                logging.info(f"Component {component}: width={width}, height={height}, x_pos={centroid_x}")
                 
                 if width >= size_threshold_width and height >= size_threshold_height:
                     if mode == "convex_polygons":
@@ -1424,4 +1432,258 @@ class SeparateMasks:
             return out_masks,
         else:
             return torch.empty((1, 64, 64), device=mask.device),
+
+
+class ConsolidateMasksKJ:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "masks": ("MASK",),
+                "width": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 64}),
+                "height": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 64}),
+                "padding": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "consolidate"
+
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Consolidates a batch of separate masks by finding the largest group of masks that fit inside a tile of the given width and height (including the padding), and repeating until no more masks can be combined."
+
+    def consolidate(self, masks, width=512, height=512, padding=0):
+        B, H, W = masks.shape
+
+        def mask_fits(coords, candidate_coords):
+            x_min, y_min, x_max, y_max = coords
+            cx_min, cy_min, cx_max, cy_max = candidate_coords
+            nx_min, ny_min = min(x_min, cx_min), min(y_min, cy_min)
+            nx_max, ny_max = max(x_max, cx_max), max(y_max, cy_max)
+            if nx_min + width < nx_max + padding or ny_min + height < ny_max + padding:
+                return False, coords
+            return True, (nx_min, ny_min, nx_max, ny_max)
+
+        separated = []
+        final_masks = []
+        for b in range(B):
+            m = masks[b]
+            rows, cols = m.any(dim=1), m.any(dim=0)
+            y_min, y_max = torch.where(rows)[0][[0, -1]]
+            x_min, x_max = torch.where(cols)[0][[0, -1]]
+            w = x_max - x_min + 1
+            h = y_max - y_min + 1
+            separated.append(((x_min.item(), y_min.item(), x_max.item(), y_max.item()), m))
+
+        separated.sort(key=lambda x: x[0])
+        fits = []
+        for i, masks in enumerate(separated):
+            coord = masks[0]
+            fits_in_box = []
+            for j, cand_mask in enumerate(separated):
+                if i == j:
+                    continue
+                r, coord = mask_fits(coord, cand_mask[0])
+                if r:
+                    fits_in_box.append(j)
+            fits.append((i, fits_in_box))
+        fits.sort(key=lambda x: -len(x[1]))
+        seen = []
+        unique_fits = []
+        for idx, fs in fits:
+            uniq = [i for i in fs if i not in seen]
+            unique_fits.append((idx, fs, uniq))
+            seen.extend(uniq)
+        unique_fits.sort(key=lambda x: (-len(x[1]), -len(x[2])))
+        merged = []
+        for mask_idx, fitting_masks, _ in unique_fits:
+            if mask_idx in merged:
+                continue
+            fitting_masks = [i for i in fitting_masks if i not in merged]
+            combined_mask = separated[mask_idx][1].clone()
+            for i in fitting_masks:
+                combined_mask += separated[i][1]
+                merged.append(i)
+            merged.append(mask_idx)
+            final_masks.append(combined_mask)
+
+        logging.info(f"Consolidated {B} masks into {len(final_masks)}")
+        return (torch.stack(final_masks, dim=0),)
+
+
+class DrawMaskOnImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "image": ("IMAGE", ),
+                    "mask": ("MASK", ),
+                    "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB/RGBA values in range 0-255 or 0.0-1.0, separated by commas. Ex: 255, 0, 0, 128"}),
+                  },
+                  "optional": {
+                    "device": (["cpu", "gpu"], {"default": "cpu", "tooltip": "Device to use for processing"}),
+                }
+        }
+
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("images",)
+    FUNCTION = "apply"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Applies the provided masks to the input images with Alpha Blending support."
+
+    def apply(self, image, mask, color, device="cpu"):
+        B, H, W, C = image.shape
+        BM, HM, WM = mask.shape
+
+        processing_device = main_device if device == "gpu" else torch.device("cpu")
+
+        in_masks = mask.clone().to(processing_device)
+        in_images = image.clone().to(processing_device)
+
+        # Resize mask if dimensions don't match
+        if HM != H or WM != W:
+            in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
+        # Handle batch size mismatch
+        if B > BM:
+            in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
+        elif BM > B:
+            in_masks = in_masks[:B]
+
+        output_images = []
+
+        # Parse Color String (Handle RGB, RGBA, and Hex formats)
+        color = color.strip()
+        color_values = []
+
+        if color.startswith('#'):
+            # Handle hex format (#RGB, #RGBA, #RRGGBB, #RRGGBBAA)
+            hex_color = color.lstrip('#')
+            if len(hex_color) == 3:  # #RGB
+                color_values = [int(c*2, 16) / 255.0 for c in hex_color]
+            elif len(hex_color) == 4:  # #RGBA
+                color_values = [int(c*2, 16) / 255.0 for c in hex_color]
+            elif len(hex_color) == 6:  # #RRGGBB
+                color_values = [int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+            elif len(hex_color) == 8:  # #RRGGBBAA
+                color_values = [int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4, 6)]
+            else:
+                raise ValueError(f"Invalid hex color format: {color}")
+        else:
+            # Handle comma-separated RGB/RGBA format
+            for x in color.split(","):
+                val = float(x.strip())
+                color_values.append(val / 255.0 if val > 1.0 else val)
+
+        rgb = color_values[:3]
+        alpha_val = color_values[3] if len(color_values) == 4 else 1.0
+
+        fill_color = torch.tensor(rgb, dtype=torch.float32, device=processing_device)
+
+        for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
+            curr_mask = in_masks[i] # [H, W]
+            img_idx = min(i, B - 1)
+            curr_image = in_images[img_idx] # [H, W, C]
+
+            blend_factor = curr_mask.unsqueeze(-1) * alpha_val
+            img_channels = curr_image.shape[-1]
+
+            if img_channels == 4:
+                img_rgb = curr_image[..., :3]
+                img_a = curr_image[..., 3:]
+                out_rgb = img_rgb * (1 - blend_factor) + fill_color * blend_factor
+                out_a = torch.maximum(img_a, blend_factor)
+                masked_image = torch.cat((out_rgb, out_a), dim=-1)
+            else:
+                masked_image = curr_image * (1 - blend_factor) + fill_color * blend_factor
+            output_images.append(masked_image)
+
+        if not output_images:
+            return (torch.zeros((0, H, W, C), dtype=image.dtype),)
+
+        out_tensor = torch.stack(output_images, dim=0).cpu()
+
+        return (out_tensor, )
+
+class BlockifyMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "masks": ("MASK",),
+                    "block_size": ("INT", {"default": 32, "min": 8, "max": 512, "step": 1, "tooltip": "Size of blocks in pixels (smaller = smaller blocks)"}),
+                },
+                "optional": {
+                    "device": (["cpu", "gpu"], {"default": "cpu", "tooltip": "Device to use for processing"}),
+                }
+        }
+
+    RETURN_TYPES = ("MASK", )
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "process"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Creates a block mask by dividing the bounding box of each mask into blocks of the specified size and filling in blocks that contain any part of the original mask."
+
+    def process(self, masks, block_size, device="cpu"):
+        processing_device = main_device if device == "gpu" else torch.device("cpu")
         
+        masks = masks.to(processing_device)
+        batch_size, height, width = masks.shape
+        
+        result_masks = torch.zeros_like(masks)
+        
+        for i in tqdm(range(batch_size), desc="BlockifyMask batch"):
+            mask = masks[i]
+            
+            # Find bounding box efficiently
+            mask_bool = mask > 0
+            if not mask_bool.any():
+                continue
+                
+            y_indices = torch.nonzero(mask_bool.any(dim=1), as_tuple=True)[0]
+            x_indices = torch.nonzero(mask_bool.any(dim=0), as_tuple=True)[0]
+            
+            if len(y_indices) == 0 or len(x_indices) == 0:
+                continue
+                
+            y_min, y_max = y_indices[0], y_indices[-1]
+            x_min, x_max = x_indices[0], x_indices[-1]
+            
+            bbox_width = x_max - x_min + 1
+            bbox_height = y_max - y_min + 1
+            
+            # Calculate block grid
+            w_divisions = max(1, bbox_width // block_size)
+            h_divisions = max(1, bbox_height // block_size)
+            
+            w_slice = bbox_width // w_divisions
+            h_slice = bbox_height // h_divisions
+            
+            # Create coordinate grids only for bbox region
+            y_coords = torch.arange(y_min, y_max + 1, device=processing_device).view(-1, 1)
+            x_coords = torch.arange(x_min, x_max + 1, device=processing_device).view(1, -1)
+            
+            # Calculate block indices for bbox region
+            w_block_indices = (x_coords - x_min) // w_slice
+            h_block_indices = (y_coords - y_min) // h_slice
+            
+            # Clamp to valid range
+            w_block_indices = w_block_indices.clamp(0, w_divisions - 1)
+            h_block_indices = h_block_indices.clamp(0, h_divisions - 1)
+            
+            # Create unique block IDs by combining h and w indices
+            block_ids = h_block_indices * w_divisions + w_block_indices
+            
+            # Get mask region within bbox
+            mask_region = mask[y_min:y_max+1, x_min:x_max+1]
+            
+            # Find which blocks have content using scatter_add
+            max_blocks = h_divisions * w_divisions
+            block_content = torch.zeros(max_blocks, device=processing_device)
+            block_content.scatter_add_(0, block_ids.flatten(), mask_region.flatten())
+            
+            # Create result for blocks that have content
+            has_content = block_content > 0
+            block_mask = has_content[block_ids]
+            
+            # Fill the result
+            result_masks[i, y_min:y_max+1, x_min:x_max+1] = block_mask.float()
+        
+        return (result_masks.clamp(0, 1),)

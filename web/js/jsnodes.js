@@ -1,5 +1,5 @@
-import { app } from "../../../scripts/app.js";
-import { applyTextReplacements } from "../../../scripts/utils.js";
+const { app } = window.comfyAPI.app;
+const { applyTextReplacements } = window.comfyAPI.utils;
 
 app.registerExtension({
 	name: "KJNodes.jsnodes",
@@ -90,6 +90,7 @@ app.registerExtension({
 			case "FluxBlockLoraSelect":
 			case "HunyuanVideoBlockLoraSelect":
 			case "Wan21BlockLoraSelect":
+			case "LTX2BlockLoraSelect":
 				nodeType.prototype.onNodeCreated = function () {
 					this.addWidget("button", "Set all", null, () => {
 						const userInput = prompt("Enter the values to set for widgets (e.g., s0,1,2-7=2.0, d0,1,2-7=2.0, or 1.0):", "");
@@ -187,6 +188,35 @@ app.registerExtension({
 					this.outputs[1]["label"] = values[1] + " width"
 					this.outputs[2]["label"] = values[2] + " height" 
 					this.outputs[3]["label"] = values[0] + " count" 
+					return r
+				}
+				break;
+
+			case "GetLatentSizeAndCount":
+				const onGetLatentConnectInput = nodeType.prototype.onConnectInput;
+				nodeType.prototype.onConnectInput = function (targetSlot, type, output, originNode, originSlot) {
+					console.log(this)
+					const v = onGetLatentConnectInput? onGetLatentConnectInput.apply(this, arguments): undefined
+					//console.log(this)
+					this.outputs[1]["label"] = "batch_size"
+					this.outputs[2]["label"] = "channels" 
+					this.outputs[3]["label"] = "frames" 
+					this.outputs[4]["label"] = "height" 
+					this.outputs[5]["label"] = "width"
+					return v;
+				}
+				//const onGetImageSizeExecuted = nodeType.prototype.onExecuted;
+				const onGetLatentSizeExecuted = nodeType.prototype.onAfterExecuteNode;
+				nodeType.prototype.onExecuted = function(message) {
+					console.log(this)
+					const r = onGetLatentSizeExecuted? onGetLatentSizeExecuted.apply(this,arguments): undefined
+					let values = message["text"].toString().split('x').map(Number);
+					console.log(values)
+					this.outputs[1]["label"] = values[0] + " batch"
+					this.outputs[2]["label"] = values[1] + " channels" 
+					this.outputs[3]["label"] = values[2] + " frames" 
+					this.outputs[4]["label"] = values[3] + " height" 
+					this.outputs[5]["label"] = values[4] + " width" 
 					return r
 				}
 				break;
